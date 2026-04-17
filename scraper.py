@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Monitor de ingressos BTS - BuyTicket Brasil
+Monitor de ingressos BTS - BuyTicket Brasil + Ticketmaster
 Roda uma vez e envia email se encontrar ingressos disponíveis.
-Agendado via GitHub Actions para rodar a cada 5 minutos.
+Agendado via GitHub Actions para rodar a cada 15 minutos.
 
 Variáveis de ambiente necessárias:
     EMAIL_FROM      - email remetente
@@ -23,42 +23,45 @@ from datetime import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
+import requests
+from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
 
-DATAS = ["28-10-2026", "30-10-2026", "31-10-2026"]
-BASE_URL = "https://bts.buyticketbrasil.com/ingressos?data="
+# BuyTicket
+DATAS_BUYTICKET = ["28-10-2026", "30-10-2026", "31-10-2026"]
+BUYTICKET_URL = "https://bts.buyticketbrasil.com/ingressos?data="
 SETORES_CONHECIDOS = ["Cadeira Inferior", "Arquibancada", "Pista", "Cadeira Superior"]
 
+# Ticketmaster
+TICKETMASTER_URL = "https://www.ticketmaster.com.br/event/bts-world-tour-arirang"
+DATAS_TM = ["28 DE OUTUBRO", "30 DE OUTUBRO", "31 DE OUTUBRO"]
 
-def enviar_email(disponiveis_por_data: dict[str, list[str]]):
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+}
+
+
+def enviar_email(alertas: list[str]):
     email_from = os.environ["EMAIL_FROM"]
     email_to = os.environ["EMAIL_TO"]
     password = os.environ["EMAIL_PASSWORD"]
     smtp_host = os.environ.get("SMTP_HOST", "smtp.gmail.com")
     smtp_port = int(os.environ.get("SMTP_PORT", "465"))
-    # SMTP_TLS=false para desativar SSL (ex: porta 587 com STARTTLS)
     use_ssl = os.environ.get("SMTP_TLS", "true").lower() != "false"
 
-    linhas = []
-    for data, setores in disponiveis_por_data.items():
-        linhas.append(f"Data {data}:")
-        for s in setores:
-            linhas.append(f"  - {s}")
-        linhas.append(f"  Link: {BASE_URL}{data}")
-        linhas.append("")
-
     corpo = "\n".join([
-        "INGRESSOS DISPONÍVEIS NO BUYTICKET BTS!",
+        "INGRESSOS BTS DISPONÍVEIS!",
         "=" * 40,
         "",
-        *linhas,
+        *alertas,
+        "",
         "Corra para garantir o seu ingresso!",
     ])
 
     msg = MIMEMultipart()
     msg["From"] = email_from
     msg["To"] = email_to
-    msg["Subject"] = "🚨 INGRESSO BTS DISPONÍVEL - BuyTicket"
+    msg["Subject"] = "🚨 INGRESSO BTS DISPONÍVEL"
     msg.attach(MIMEText(corpo, "plain", "utf-8"))
 
     if use_ssl:
@@ -74,9 +77,11 @@ def enviar_email(disponiveis_por_data: dict[str, list[str]]):
     print(f"  Email enviado para {email_to}")
 
 
-async def checar_data(page, data: str) -> list[str]:
-    url = BASE_URL + data
-    print(f"  {data}... ", end="", flush=True)
+# --- BuyTicket (Playwright) ---
+
+async def checar_buyticket(page, data: str) -> list[str]:
+    url = BUYTICKET_URL + data
+    print(f"  BuyTicket {data}... ", end="", flush=True)
 
     try:
         await page.goto(url, wait_until="networkidle", timeout=30000)
@@ -112,32 +117,71 @@ async def checar_data(page, data: str) -> list[str]:
         return []
 
 
+# --- Ticketmaster (requests) ---
+
+def checar_ticketmaster() -> list[str]:
+    print(f"  Ticketmaster... ", end="", flush=True)
+    try:
+        r = requests.get(TICKETMASTER_URL, headers=HEADERS, timeout=15)
+        soup = BeautifulSoup(r.text, "html.parser")
+        texto = soup.get_text()
+
+        disponiveis = []
+        for data in DATAS_TM:
+            # Pega o trecho da página ao redor de cada data
+            idx = texto.find(data)
+            if idx == -1:
+                continue
+            trecho = texto[idx:idx + 200].upper()
+            if "ESGOTADO" not in trecho:
+                disponiveis.append(data)
+
+        if disponiveis:
+            print(f"DISPONÍVEL -> {disponiveis}")
+        else:
+            print("esgotado")
+
+        return disponiveis
+
+    except Exception as e:
+        print(f"erro: {e}")
+        return []
+
+
+# --- Main ---
+
 async def main():
     agora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{agora}] Checando ingressos BTS...")
+    print(f"[{agora}] Checando ingressos BTS...\n")
 
+    alertas = []
+
+    # Ticketmaster (rápido, sem browser)
+    tm_disponiveis = checar_ticketmaster()
+    for data in tm_disponiveis:
+        alertas.append(f"[TICKETMASTER] {data} - {TICKETMASTER_URL}")
+
+    # BuyTicket (Playwright)
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        )
+        context = await browser.new_context(user_agent=HEADERS["User-Agent"])
         page = await context.new_page()
 
-        disponiveis_por_data = {}
-        for data in DATAS:
-            resultado = await checar_data(page, data)
+        for data in DATAS_BUYTICKET:
+            resultado = await checar_buyticket(page, data)
             if resultado:
-                disponiveis_por_data[data] = resultado
+                for setor in resultado:
+                    alertas.append(f"[BUYTICKET] {data}: {setor} - {BUYTICKET_URL}{data}")
 
         await browser.close()
 
-    if disponiveis_por_data:
+    if alertas:
         print("\nINGRESSOS ENCONTRADOS! Enviando email...")
-        enviar_email(disponiveis_por_data)
-        sys.exit(0)
+        enviar_email(alertas)
     else:
-        print("Nenhum ingresso disponível.")
-        sys.exit(0)
+        print("\nNenhum ingresso disponível.")
+
+    sys.exit(0)
 
 
 if __name__ == "__main__":
