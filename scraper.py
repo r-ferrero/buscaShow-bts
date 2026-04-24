@@ -27,7 +27,7 @@ import requests
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
 
-# BuyTicket
+# BuyTicket (bts.buyticketbrasil.com)
 DATAS_BUYTICKET = ["28-10-2026", "30-10-2026", "31-10-2026"]
 BUYTICKET_URL = "https://bts.buyticketbrasil.com/ingressos?data="
 SETORES_CONHECIDOS = ["Cadeira Inferior", "Arquibancada", "Pista", "Cadeira Superior"]
@@ -35,6 +35,16 @@ SETORES_CONHECIDOS = ["Cadeira Inferior", "Arquibancada", "Pista", "Cadeira Supe
 # Ticketmaster
 TICKETMASTER_URL = "https://www.ticketmaster.com.br/event/bts-world-tour-arirang"
 DATAS_TM = ["28 DE OUTUBRO", "30 DE OUTUBRO", "31 DE OUTUBRO"]
+
+# BuyTicket Brasil (buyticketbrasil.com) — mercado secundário, filtro Pista < R$2000
+EVENTO_LOCAL = "1775752182066x607042691407020000"
+DATAS_BTB = {
+    "28-10-2026": "1793242799000",
+    "30-10-2026": "1793415599000",
+    "31-10-2026": "1793501999000",
+}
+BTB_BASE_URL = f"https://buyticketbrasil.com/evento/bts\u20132026worldtourarirang"
+BTB_PRECO_MAX = 2000  # alertar se Pista abaixo desse valor
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -148,6 +158,56 @@ def checar_ticketmaster() -> list[str]:
         return []
 
 
+# --- BuyTicket Brasil (buyticketbrasil.com) ---
+
+async def checar_btb(page, data: str, timestamp: str) -> list[str]:
+    url = f"{BTB_BASE_URL}?data={timestamp}&evento_local={EVENTO_LOCAL}"
+    print(f"  BTBrasil {data}... ", end="", flush=True)
+
+    try:
+        await page.goto(url, wait_until="networkidle", timeout=30000)
+        await page.wait_for_timeout(2000)
+
+        # Clica no dropdown para revelar tipos e preços
+        tipo_loc = page.locator("text=Tipo de ingresso")
+        if await tipo_loc.count() == 0:
+            print("sem ingressos")
+            return []
+        await tipo_loc.click()
+        await page.wait_for_timeout(1500)
+
+        texto = await page.evaluate("() => document.body.innerText")
+        linhas = [l.strip() for l in texto.split("\n") if l.strip()]
+
+        # Mapeia setor -> preço
+        precos = {}
+        for i, linha in enumerate(linhas):
+            if linha == "Pista":
+                proxima = linhas[i + 1] if i + 1 < len(linhas) else ""
+                if proxima.startswith("R$"):
+                    valor_str = proxima.replace("R$", "").replace(".", "").replace(",", ".").strip()
+                    try:
+                        precos["Pista"] = float(valor_str)
+                    except ValueError:
+                        pass
+
+        alertas = []
+        for setor, preco in precos.items():
+            if preco < BTB_PRECO_MAX:
+                alertas.append(f"{setor} R${preco:,.0f}".replace(",", "."))
+                print(f"DISPONÍVEL {setor} R${preco:,.0f} (abaixo de R${BTB_PRECO_MAX})")
+
+        if not alertas:
+            pista_str = f"R${precos['Pista']:,.0f}".replace(",", ".") if "Pista" in precos else "sem ingresso"
+            print(f"Pista {pista_str} (acima do limite)")
+
+        return alertas
+
+    except Exception as e:
+        print(f"erro: {e}")
+        return []
+
+
 # --- Main ---
 
 async def main():
@@ -172,6 +232,14 @@ async def main():
             if resultado:
                 for setor in resultado:
                     alertas.append(f"[BUYTICKET] {data}: {setor} - {BUYTICKET_URL}{data}")
+
+        # BuyTicket Brasil (mercado secundário, Pista < R$2000)
+        for data, timestamp in DATAS_BTB.items():
+            resultado = await checar_btb(page, data, timestamp)
+            if resultado:
+                link = f"{BTB_BASE_URL}?data={timestamp}&evento_local={EVENTO_LOCAL}"
+                for item in resultado:
+                    alertas.append(f"[BUYTICKETBRASIL] {data}: Pista {item} - {link}")
 
         await browser.close()
 
