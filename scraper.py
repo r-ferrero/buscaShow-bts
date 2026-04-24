@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Monitor de ingressos BTS - BuyTicket Brasil + Ticketmaster
+Monitor de ingressos BTS - Ticketmaster + BuyTicket Brasil
 Roda uma vez e envia email se encontrar ingressos disponíveis.
 Agendado via GitHub Actions para rodar a cada 15 minutos.
 
@@ -27,11 +27,6 @@ import requests
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
 
-# BuyTicket (bts.buyticketbrasil.com)
-DATAS_BUYTICKET = ["28-10-2026", "30-10-2026", "31-10-2026"]
-BUYTICKET_URL = "https://bts.buyticketbrasil.com/ingressos?data="
-SETORES_CONHECIDOS = ["Cadeira Inferior", "Arquibancada", "Pista", "Cadeira Superior"]
-
 # Ticketmaster
 TICKETMASTER_URL = "https://www.ticketmaster.com.br/event/bts-world-tour-arirang"
 DATAS_TM = ["28 DE OUTUBRO", "30 DE OUTUBRO", "31 DE OUTUBRO"]
@@ -43,7 +38,7 @@ DATAS_BTB = {
     "30-10-2026": "1793415599000",
     "31-10-2026": "1793501999000",
 }
-BTB_BASE_URL = f"https://buyticketbrasil.com/evento/bts\u20132026worldtourarirang"
+BTB_BASE_URL = "https://buyticketbrasil.com/evento/bts\u20132026worldtourarirang"
 BTB_PRECO_MAX = 2000  # alertar se Pista abaixo desse valor
 
 HEADERS = {
@@ -87,50 +82,10 @@ def enviar_email(alertas: list[str]):
     print(f"  Email enviado para {email_to}")
 
 
-# --- BuyTicket (Playwright) ---
-
-async def checar_buyticket(page, data: str) -> list[str]:
-    url = BUYTICKET_URL + data
-    print(f"  BuyTicket {data}... ", end="", flush=True)
-
-    try:
-        await page.goto(url, wait_until="networkidle", timeout=30000)
-        await page.wait_for_timeout(1500)
-
-        texto = await page.evaluate("() => document.body.innerText")
-        linhas = [l.strip() for l in texto.split("\n") if l.strip()]
-
-        try:
-            inicio = linhas.index("Escolha o setor") + 1
-            fim = linhas.index("PASSO 2", inicio)
-            secao = linhas[inicio:fim]
-        except ValueError:
-            secao = linhas
-
-        disponiveis = []
-        for i, linha in enumerate(secao):
-            if linha in SETORES_CONHECIDOS:
-                proxima = secao[i + 1] if i + 1 < len(secao) else ""
-                if proxima.upper() != "ESGOTADO":
-                    status = proxima if proxima else "disponível"
-                    disponiveis.append(f"{linha} ({status})")
-
-        if disponiveis:
-            print(f"DISPONÍVEL -> {disponiveis}")
-        else:
-            print("esgotado")
-
-        return disponiveis
-
-    except Exception as e:
-        print(f"erro: {e}")
-        return []
-
-
 # --- Ticketmaster (requests) ---
 
 def checar_ticketmaster() -> list[str]:
-    print(f"  Ticketmaster... ", end="", flush=True)
+    print("  Ticketmaster... ", end="", flush=True)
     try:
         r = requests.get(TICKETMASTER_URL, headers=HEADERS, timeout=15)
         soup = BeautifulSoup(r.text, "html.parser")
@@ -138,7 +93,6 @@ def checar_ticketmaster() -> list[str]:
 
         disponiveis = []
         for data in DATAS_TM:
-            # Pega o trecho da página ao redor de cada data
             idx = texto.find(data)
             if idx == -1:
                 continue
@@ -168,7 +122,6 @@ async def checar_btb(page, data: str, timestamp: str) -> list[str]:
         await page.goto(url, wait_until="networkidle", timeout=30000)
         await page.wait_for_timeout(2000)
 
-        # Clica no dropdown para revelar tipos e preços
         tipo_loc = page.locator("text=Tipo de ingresso")
         if await tipo_loc.count() == 0:
             print("sem ingressos")
@@ -179,7 +132,6 @@ async def checar_btb(page, data: str, timestamp: str) -> list[str]:
         texto = await page.evaluate("() => document.body.innerText")
         linhas = [l.strip() for l in texto.split("\n") if l.strip()]
 
-        # Mapeia setor -> preço
         precos = {}
         for i, linha in enumerate(linhas):
             if linha == "Pista":
@@ -221,19 +173,12 @@ async def main():
     for data in tm_disponiveis:
         alertas.append(f"[TICKETMASTER] {data} - {TICKETMASTER_URL}")
 
-    # BuyTicket (Playwright)
+    # BuyTicket Brasil (mercado secundário, Pista < R$2000)
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context(user_agent=HEADERS["User-Agent"])
         page = await context.new_page()
 
-        for data in DATAS_BUYTICKET:
-            resultado = await checar_buyticket(page, data)
-            if resultado:
-                for setor in resultado:
-                    alertas.append(f"[BUYTICKET] {data}: {setor} - {BUYTICKET_URL}{data}")
-
-        # BuyTicket Brasil (mercado secundário, Pista < R$2000)
         for data, timestamp in DATAS_BTB.items():
             resultado = await checar_btb(page, data, timestamp)
             if resultado:
